@@ -78,34 +78,27 @@ func findIIODeviceByName(name string) (string, error) {
 	name = strings.TrimSpace(name)
 	nameLower := strings.ToLower(name)
 
-	var exact, partial string
-	var withBoth, withGyro, withAccel string
+	var exact, partial, firstWithIMU string
 
-	names := make([]string, 0, len(entries))
 	for _, e := range entries {
-		if e.IsDir() && strings.HasPrefix(e.Name(), "iio:device") {
-			names = append(names, e.Name())
+		if !e.IsDir() || !strings.HasPrefix(e.Name(), "iio:device") {
+			continue
 		}
-	}
-	sort.Strings(names)
-
-	for _, n := range names {
-		dev := filepath.Join(base, n)
+		dev := filepath.Join(base, e.Name())
 		b, _ := os.ReadFile(filepath.Join(dev, "name"))
 		devName := strings.TrimSpace(string(b))
 		devLower := strings.ToLower(devName)
 
 		hasGyro := fileExists(filepath.Join(dev, "in_anglvel_x_raw"))
 		hasAccel := fileExists(filepath.Join(dev, "in_accel_x_raw"))
-		if withBoth == "" && hasGyro && hasAccel {
-			withBoth = dev
-		} else if withGyro == "" && hasGyro {
-			withGyro = dev
-		} else if withAccel == "" && hasAccel {
-			withAccel = dev
+		if firstWithIMU == "" && (hasGyro || hasAccel) {
+			firstWithIMU = dev
 		}
 		// si no se pidió nombre, devolvemos el primero con IMU
 		if nameLower == "" {
+			if firstWithIMU != "" {
+				return firstWithIMU, nil
+			}
 			continue
 		}
 		// match exacto (case-insensitive)
@@ -124,12 +117,8 @@ func findIIODeviceByName(name string) (string, error) {
 		return exact, nil
 	case partial != "":
 		return partial, nil
-	case nameLower == "" && withBoth != "":
-		return withBoth, nil
-	case nameLower == "" && withGyro != "":
-		return withGyro, nil
-	case nameLower == "" && withAccel != "":
-		return withAccel, nil
+	case firstWithIMU != "":
+		return firstWithIMU, nil
 	default:
 		return "", fmt.Errorf("iio device with name %q not found", name)
 	}
@@ -356,70 +345,6 @@ func openIIODevice(base string) (*IIODevice, error) {
 	return dev, nil
 }
 
-func setScalesForDevice(dev *IIODevice) {
-	if dev == nil {
-		return
-	}
-	changed := false
-	base := dev.Base
-	// Gyro
-	if dev.HaveGyro && dev.GyroScale.X == 0 && dev.GyroScale.Y == 0 && dev.GyroScale.Z == 0 {
-		if avail, err := readFloatList(filepath.Join(base, "in_anglvel_scales_available")); err == nil {
-			pick := avail[len(avail)/2] // el del medio
-			if err := writeFloat(filepath.Join(base, "in_anglvel_scale"), pick); err == nil {
-				fmt.Printf("Set in_anglvel_scale=%g (%s)\n", pick, base)
-				dev.GyroScale = Vec3{X: pick, Y: pick, Z: pick}
-				changed = true
-			}
-		}
-	}
-	// Accel
-	if dev.HaveAccel && dev.AccelScale.X == 0 && dev.AccelScale.Y == 0 && dev.AccelScale.Z == 0 {
-		if avail, err := readFloatList(filepath.Join(base, "in_accel_scales_available")); err == nil {
-			pick := avail[len(avail)/2]
-			if err := writeFloat(filepath.Join(base, "in_accel_scale"), pick); err == nil {
-				fmt.Printf("Set in_accel_scale=%g (%s)\n", pick, base)
-				dev.AccelScale = Vec3{X: pick, Y: pick, Z: pick}
-				changed = true
-			}
-		}
-	}
-	if changed {
-		if dev.HaveGyro && dev.HaveAccel {
-			fmt.Printf("New scales → Gyro(%.6f) Accel(%.6f) (%s)\n", dev.GyroScale.X, dev.AccelScale.X, base)
-		} else if dev.HaveGyro {
-			fmt.Printf("New scales → Gyro(%.6f) (%s)\n", dev.GyroScale.X, base)
-		} else if dev.HaveAccel {
-			fmt.Printf("New scales → Accel(%.6f) (%s)\n", dev.AccelScale.X, base)
-		}
-	}
-}
-
-func setRatesForDevice(dev *IIODevice, rate int) {
-	if dev == nil {
-		return
-	}
-	base := dev.Base
-	// gyro
-	if dev.HaveGyro {
-		if avail, err := readFloatList(filepath.Join(base, "in_anglvel_sampling_frequency_available")); err == nil {
-			pick := nearest(avail, float64(rate))
-			if err := writeFloat(filepath.Join(base, "in_anglvel_sampling_frequency"), pick); err == nil {
-				fmt.Printf("Set in_anglvel_sampling_frequency=%g (%s)\n", pick, base)
-			}
-		}
-	}
-	// accel
-	if dev.HaveAccel {
-		if avail, err := readFloatList(filepath.Join(base, "in_accel_sampling_frequency_available")); err == nil {
-			pick := nearest(avail, float64(rate))
-			if err := writeFloat(filepath.Join(base, "in_accel_sampling_frequency"), pick); err == nil {
-				fmt.Printf("Set in_accel_sampling_frequency=%g (%s)\n", pick, base)
-			}
-		}
-	}
-}
-
 func (d *IIODevice) readSample() (IMUSample, error) {
 	s := IMUSample{TSus: uint64(time.Now().UnixMicro())}
 	if d.HaveGyro {
@@ -515,9 +440,15 @@ func main() {
 	} else {
 		iioBase, err = findIIODeviceByName(cfg.Name)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "IIO device not found (name=%q). Tip: try --list-iio or --iio-path=/sys/bus/iio/devices/iio:deviceX\n", cfg.Name)
-			listIIODevices()
-			os.Exit(1)
+			// fallback duro si existe iio:device0
+			if fileExists("/sys/bus/iio/devices/iio:device0") {
+				iioBase = "/sys/bus/iio/devices/iio:device0"
+				fmt.Fprintf(os.Stderr, "WARN: name=%q not found; falling back to %s\n", cfg.Name, iioBase)
+			} else {
+				fmt.Fprintf(os.Stderr, "IIO device not found (name=%q). Tip: try --list-iio or --iio-path=/sys/bus/iio/devices/iio:deviceX\n", cfg.Name)
+				listIIODevices()
+				os.Exit(1)
+			}
 		}
 	}
 
@@ -554,16 +485,54 @@ func main() {
 	
 	// Auto-set scales if requested and currently zero
 	if *setScales {
-		setScalesForDevice(dev)
-		setScalesForDevice(gyroDev)
-		setScalesForDevice(accelDev)
+		changed := false
+		// Gyro
+		if dev.HaveGyro && dev.GyroScale.X == 0 && dev.GyroScale.Y == 0 && dev.GyroScale.Z == 0 {
+			if avail, err := readFloatList(filepath.Join(iioBase, "in_anglvel_scales_available")); err == nil {
+				pick := avail[len(avail)/2] // el del medio
+				if err := writeFloat(filepath.Join(iioBase, "in_anglvel_scale"), pick); err == nil {
+					fmt.Printf("Set in_anglvel_scale=%g\n", pick)
+					dev.GyroScale = Vec3{X: pick, Y: pick, Z: pick}
+					changed = true
+				}
+			}
+		}
+		// Accel
+		if dev.HaveAccel && dev.AccelScale.X == 0 && dev.AccelScale.Y == 0 && dev.AccelScale.Z == 0 {
+			if avail, err := readFloatList(filepath.Join(iioBase, "in_accel_scales_available")); err == nil {
+				pick := avail[len(avail)/2]
+				if err := writeFloat(filepath.Join(iioBase, "in_accel_scale"), pick); err == nil {
+					fmt.Printf("Set in_accel_scale=%g\n", pick)
+					dev.AccelScale = Vec3{X: pick, Y: pick, Z: pick}
+					changed = true
+				}
+			}
+		}
+		if changed {
+			fmt.Printf("New scales → Gyro(%.6f) Accel(%.6f)\n", dev.GyroScale.X, dev.AccelScale.X)
+		}
 	}
 
 	// Auto-set sampling frequency
 	if *setRate {
-		setRatesForDevice(dev, *rate)
-		setRatesForDevice(gyroDev, *rate)
-		setRatesForDevice(accelDev, *rate)
+		// gyro
+		if dev.HaveGyro {
+			if avail, err := readFloatList(filepath.Join(iioBase, "in_anglvel_sampling_frequency_available")); err == nil {
+				pick := nearest(avail, float64(*rate))
+				if err := writeFloat(filepath.Join(iioBase, "in_anglvel_sampling_frequency"), pick); err == nil {
+					fmt.Printf("Set in_anglvel_sampling_frequency=%g\n", pick)
+				}
+			}
+		}
+		// accel
+		if dev.HaveAccel {
+			if avail, err := readFloatList(filepath.Join(iioBase, "in_accel_sampling_frequency_available")); err == nil {
+				pick := nearest(avail, float64(*rate))
+				if err := writeFloat(filepath.Join(iioBase, "in_accel_sampling_frequency"), pick); err == nil {
+					fmt.Printf("Set in_accel_sampling_frequency=%g\n", pick)
+				}
+			}
+		}
 	}
 
 	// Mount matrix igual a tu YAML:
@@ -631,4 +600,5 @@ func main() {
 		srv.Broadcast(s)
 	}
 }
+
 
